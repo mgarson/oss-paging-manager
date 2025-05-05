@@ -31,9 +31,9 @@
 typedef struct msgbuffer
 {
 	long mtype; 
-	pid_t pid; 
-	int resId;
-	bool isRelease;
+	pid_t pid;
+	unsigned address;
+	bool isWrite;	
 	bool granted;
 } msgbuffer;
 
@@ -88,6 +88,7 @@ int main(int argc, char* argv[])
 	msgbuffer buf;
 	msgbuffer rcvbuf;
 	buf.mtype = 1;
+	buf.pid = getpid();
 	int msqid = 0;
 	key_t key;
 
@@ -104,9 +105,6 @@ int main(int argc, char* argv[])
 		perror("msgget in child\n");
 		exit(1);
 	}
-
-	// Represents how many of each resource worker holds
-	int held[MAX_RES] = {0};
 
 	// Represents time process started in ns
 	long long startTimeNs = (long long)shm_ptr[0] * 1000000000 + shm_ptr[1];
@@ -133,41 +131,8 @@ int main(int argc, char* argv[])
 				// If randomly generated number is less than term probability (40), it will terminate
 				if (die < TERM_PROB)
 				{
-					// Release all resources currently held 
-					for (int i = 0; i < MAX_RES; i++)
-					{
-						while (held[i] > 0)
-						{
-							held[i]--;
-							buf.mtype = 1;
-							buf.resId = i;
-							buf.isRelease = true;
-
-							// Send message to OSS informing of release
-							if (msgsnd(msqid, &buf, sizeof(buf) - sizeof(long), 0) == -1)
-							{
-								perror("msgsnd release");
-								exit(1);
-							}
-							// Increment time for message sending
-							addTime();
-							
-							// Wait for OSS to acknowledge realease
-							if (msgrcv(msqid, &rcvbuf, sizeof(rcvbuf) - sizeof(long), getpid(), 0) == -1)
-							{
-								perror("msgrcv release ack");
-								exit(1);
-							}
-							// Increment time for message receivingg
-							addTime();
-
-						
-						}
-					}
-
 					// Detach from shared memory and exit
 					if (shmdt(shm_ptr) == -1)
-
 					{
 						perror("shmdt failed");
 						exit(1);
@@ -180,89 +145,24 @@ int main(int argc, char* argv[])
 		// Determine if current time has reached time for worker to act
 		if (currTimeNs >= nAct)
 		{
-			// Randomly generate number up to 100 to determine if worker will request or release
-			int outcome = rand() % 100;
-			bool release;
-			// If outcome is greater than 5, worker will request. Otherwise worker will release
-			if (outcome > 5)
-				release = false;
-			else
-				release = true;
 
+			buf.address = rand() % 32768;
+			buf.isWrite = rand() % 2;
+			buf.granted = false;
 
-			int r;
-			if (release) // Worker is releasing
-			{
-				// Randomly choose a resource to release
-				int tries = 0;
-				while (tries < MAX_RES)
-				{
-					r = rand() % MAX_RES;
-					if (held[r] > 0)
-						break;
-					tries++;
-				}
-				// Once max resource amount is reached, randomly generate time for next act and continue
-				if (tries == MAX_RES)
-				{
-					nAct = currTimeNs + (rand() % BOUND_NS);
-					continue;
-				}
-			}
-			else // Worker is requestin
-			{
-				// Randomly choose a resource to request
-				int tries = 0;
-				while (tries < MAX_RES)
-				{
-					r = rand() % MAX_RES;
-					if (held[r] < INST_PER_RES)
-						break;
-					tries++;
-				}
-				// Once max resource amount is reached, randomly generate time for next act and continue
-				if (tries == MAX_RES)
-				{
-					nAct = currTimeNs + (rand() % BOUND_NS);
-					continue;
-				}
-			}
-		
-
-			// Prepare info to send message to OSS, informing if it is a release or request and what resource is selected
-			buf.mtype = 1;
-			buf.pid = getpid();
-			buf.resId = r;
-			buf.isRelease = release;
-			buf.granted = false; 
-			// Send request/release message to OSS
 			if (msgsnd(msqid, &buf, sizeof(buf) - sizeof(long), 0) == -1)
 			{
-				perror("msgsnd request");
+				perror("child msgsnd");
 				exit(1);
 			}
-
-			// Increment time for message sending
 			addTime();
-		
-			// Wait until OSS sends a message back
+
 			if (msgrcv(msqid, &rcvbuf, sizeof(rcvbuf) - sizeof(long), getpid(), 0) == -1)
 			{
-				perror("msgrcv grant");
+				perror("child msgrcv");
 				exit(1);
 			}
-
-			// Increment time for message receiving
 			addTime();
-
-			if (rcvbuf.granted) // If new resource was received
-			{
-				if (release)
-					held[r]--;
-				else
-					// Increment held at resoure's location 
-					held[r]++;
-			}
 
 			// Randomly generate time for next act
 			nAct = currTimeNs + (rand() % BOUND_NS);

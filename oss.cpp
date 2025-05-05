@@ -428,6 +428,15 @@ int main(int argc, char* argv[])
 	}
 
 	frameTable = new Frame[256];
+	for (int i = 0; i < 256; i++)
+	{
+		frameTable[i].occupied = false;
+		frameTable[i].dirty = false;
+		frameTable[i].ownerPid = -1;
+		frameTable[i].pageNum = -1;
+		frameTable[i].lastRefSec = 0;
+		frameTable[i].lastRefNano = 0;
+	}
 
 	// Variables to track last printed time
         long long int lastPrintSec = shm_ptr[0];
@@ -533,8 +542,32 @@ int main(int argc, char* argv[])
 			}
 		}
 
-
-
+		if (msgrcv(msqid, &rcvbuf, sizeof(msgbuffer) - sizeof(long), 1, IPC_NOWAIT) > 0)
+		{
+			int slot = -1;
+			for (int i = 0; i < MAX_PROC; i++)
+			{
+				if (processTable[i].occupied && processTable[i].pid == rcvbuf.pid)
+				{
+					slot = i;
+					break;
+				}
+			}
+			const char* type;
+			if (rcvbuf.isWrite) 
+				type = "WRITE";
+			else 
+				type = "READ";
+			printf("OSS: P%d requested %s of address %u at time %d:%09d\n", slot, type, rcvbuf.address, shm_ptr[0], shm_ptr[1]);	
+			incrementClock(); // DOUBLE CHECK
+			buf.mtype = rcvbuf.pid;
+			buf.granted = true;
+			if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1)
+			{
+				perror("msgsnd grant");
+			}
+			else printf("OSS: reply sent to P%d at time %d:%09d\n", slot, shm_ptr[0], shm_ptr[1]);
+		}	
 	}
 
 
