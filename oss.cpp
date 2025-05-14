@@ -31,6 +31,7 @@
 
 #define PERMS 0644
 #define MAX_PROC 18
+#define FRAME_NUM 8
 
 using namespace std;
 
@@ -179,6 +180,57 @@ void printInfo(int n)
 	}
 	printf("\n");
 	if (logging) fprintf(logfile, "\n");
+}
+
+int lruReplacement(int slot)
+{
+	unsigned page = processTable[slot].waitPage;
+	
+	int frame = -1;
+	for (int i = 0; i < FRAME_NUM; i++)
+	{
+		if (!frameTable[i].occupied)
+		{
+			frame = i;
+			break;
+		}
+	}
+
+	if (frame < 0)
+	{
+		frame = 0;
+		long long oldest = (long long)frameTable[0].lastRefSec * 1000000000 + (long long)frameTable[0].lastRefNano;
+		for (int i = 1; i < FRAME_NUM; i++)
+		{
+			long long t = (long long)frameTable[i].lastRefSec * 1000000000 + (long long)frameTable[i].lastRefNano;
+			if (t < oldest)
+			{
+				oldest = t;
+				frame = i;
+			}
+		}
+
+		pid_t victim = frameTable[frame].ownerPid;
+		int vicPage = frameTable[frame].pageNum;
+		for (int i = 0; i < MAX_PROC; i++)
+		{
+			if (processTable[i].occupied && processTable[i].pid == victim)
+			{
+				processTable[i].pageTable[vicPage] = -1;
+				break;
+			}
+		}
+	}
+
+	processTable[slot].pageTable[page] = frame;
+	frameTable[frame].occupied = true;
+	frameTable[frame].ownerPid = processTable[slot].pid;
+	frameTable[frame].pageNum = page;
+	frameTable[frame].dirty = processTable[slot].waitIsWrite;
+	frameTable[frame].lastRefSec = shm_ptr[0];
+	frameTable[frame].lastRefNano = shm_ptr[1];
+
+	return frame;
 }
 
 // Signal handler to terminate all processes after 3 seconds in real time
@@ -427,8 +479,8 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	frameTable = new Frame[256];
-	for (int i = 0; i < 256; i++)
+	frameTable = new Frame[FRAME_NUM];
+	for (int i = 0; i < FRAME_NUM; i++)
 	{
 		frameTable[i].occupied = false;
 		frameTable[i].dirty = false;
@@ -490,7 +542,7 @@ int main(int argc, char* argv[])
 		if (printTotDiff >= 500000000) // Determine if time of last print surpasssed .5 sec system time
 		{
 			// If true, print table and update time since last print in sec and ns
-			printInfo(18);
+			//printInfo(18);
 			lastPrintSec = shm_ptr[0];
 			lastPrintNs = shm_ptr[1];
 		}
@@ -553,21 +605,88 @@ int main(int argc, char* argv[])
 					break;
 				}
 			}
-			const char* type;
-			if (rcvbuf.isWrite) 
-				type = "WRITE";
-			else 
-				type = "READ";
-			printf("OSS: P%d requested %s of address %u at time %d:%09d\n", slot, type, rcvbuf.address, shm_ptr[0], shm_ptr[1]);	
-			incrementClock(); // DOUBLE CHECK
-			buf.mtype = rcvbuf.pid;
-			buf.granted = true;
-			if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1)
+
+			unsigned page = rcvbuf.address / 1024;
+			if (page >= 32)
 			{
-				perror("msgsnd grant");
+				fprintf(stderr, "ERROR! OSS: bad address %u. Page %u out of range.\n", rcvbuf.address, page);
+				exit(1);
 			}
-			else printf("OSS: reply sent to P%d at time %d:%09d\n", slot, shm_ptr[0], shm_ptr[1]);
-		}	
+
+			
+			// Check page table entry
+			int frame = processTable[slot].pageTable[page];
+			if (frame != -1)
+			{
+				addOverhead();
+				frameTable[frame].lastRefSec = shm_ptr[0];
+				frameTable[frame].lastRefNano = shm_ptr[1];
+
+				buf.mtype = rcvbuf.pid;
+				buf.granted = true;
+				if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1)
+				{
+					perror("msgsnd grant");
+					exit(1);
+				}
+				else printf("OSS: P%d page %u HIT in frame %d at time %d:%09d\n", slot, page, frame, shm_ptr[0], shm_ptr[1]);
+			}
+			else // Page fault
+			{
+				printf("OSS: P%d page %u FAULT at time %d:%09d... queueing\n", slot, page, shm_ptr[0], shm_ptr[1]);
+
+				// Mark process in PCB table as waiting
+				processTable[slot].waiting = true;
+				processTable[slot].waitPage = page;
+				processTable[slot].waitIsWrite = rcvbuf.isWrite;
+				processTable[slot].waitSec = shm_ptr[0];
+				processTable[slot].waitNano = shm_ptr[1];
+
+				// Add process to wait queue
+				waitQueue.push(slot);
+			}
+		}
+
+		if (!waitQueue.empty())
+		{
+			int slot = waitQueue.front();
+			
+			currTimeNs = ((long long)shm_ptr[0] * 1000000000) + (long long)shm_ptr[1];
+			long long faultNs = (long long)processTable[slot].waitSec * 1000000000 + (long long)processTable[slot].waitNano;
+			long long latNs = 14 * 1000000;
+			if (processTable[slot].waitIsWrite)
+				latNs += 1000000;
+
+			if (currTimeNs - faultNs >= latNs)
+			{
+				waitQueue.pop();
+				unsigned page = processTable[slot].waitPage;
+				
+				int frame = lruReplacement(slot);
+
+				processTable[slot].pageTable[page] = frame;
+				processTable[slot].waiting = false;
+
+				frameTable[frame].occupied = true;
+				frameTable[frame].ownerPid = processTable[slot].pid;
+				frameTable[frame].pageNum = page;
+				frameTable[frame].dirty = processTable[slot].waitIsWrite;
+				frameTable[frame].lastRefSec = shm_ptr[0];
+				frameTable[frame].lastRefNano = shm_ptr[1];
+
+				addOverhead();
+
+				buf.mtype = processTable[slot].pid;
+				buf.granted = true;
+				if (msgsnd(msqid, &buf, sizeof(buf) - sizeof(long), 0) == -1)
+				{
+					perror("msgsnd queue grant");
+					exit(1);
+				}
+				else printf("OSS: serviced P%d page %u in frame %d at time %d:%09d\n", slot, page, processTable[slot].pageTable[page], shm_ptr[0], shm_ptr[1]);
+			}
+		}
+
 	}
 
 
