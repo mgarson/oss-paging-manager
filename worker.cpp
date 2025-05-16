@@ -1,9 +1,9 @@
-// Operating Systems Project 5
+// Operating Systems Project 6
 // Author: Maija Garson
-// Date: 04/29/2025
+// Date: 05/15/2025
 // Description: Worker process launched by oss. Uses the clock in shared memory and loops continuously. Within the loop, it will randomly generate a time to
-// act within BOUND_NS (1000). Once it acts, it will randomly generate a probability to determine if it should request a new resource or release resources
-// being held. It sends a message to oss informing if it is a request or release, along with the resource id. It will then wait for a response from oss and will
+// act within BOUND_NS (1000). Once it acts, it will randomly generate a probability to determine if it should request to read or write to a memory reference.
+// It will randomly generate an address to request to. It will then send a message to oss reflecting this. It will then wait for a response from oss and will
 // update its values if the message was granted. Each time it sends/receives a message it will increment the system clock. It will also continuously check every
 // 250000000 ns if it has run for 1 sec. If it has run for that time, it will randomly generate a probability to determine if it should terminate or continue looping.
 // Once it terminates, it will release all held resources, detaches from shared memory, and exit.
@@ -20,8 +20,6 @@
 #include <cstdlib>
 
 #define PERMS 0644
-#define MAX_RES 5
-#define INST_PER_RES 10
 #define BOUND_NS 1000
 #define TERM_CHECK_NS 250000000
 #define LIFE_NS 2000000000
@@ -146,22 +144,29 @@ int main(int argc, char* argv[])
 		if (currTimeNs >= nAct)
 		{
 
+			// Randomly generate address within allowed range
 			buf.address = rand() % 32768;
+			// Randomly determine if process will request read or write
 			buf.isWrite = rand() % 2;
+			// Clear granted flag before sending
 			buf.granted = false;
 
+			// Send message to oss
 			if (msgsnd(msqid, &buf, sizeof(buf) - sizeof(long), 0) == -1)
 			{
 				perror("child msgsnd");
 				exit(1);
 			}
+			// Add overhead for sending message
 			addTime();
 
+			// Wait to receive message back from oss
 			if (msgrcv(msqid, &rcvbuf, sizeof(rcvbuf) - sizeof(long), getpid(), 0) == -1)
 			{
 				perror("child msgrcv");
 				exit(1);
 			}
+			// Add overhead for receiving message
 			addTime();
 
 			// Randomly generate time for next act

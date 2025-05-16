@@ -1,18 +1,17 @@
 
-// Operating Systems Project 5
+// Operating Systems Project 6
 // Author: Maija Garson
-// Date: 04/29/2025
-// Description: A program that simulates a resource management operating system with deadlock detection and recovery.
+// Date: 05/15/2025
+// Description: A program that simulates a paging memory management operating system.
 // This program runs until it has forked the total amount of processes specified in the command line, while allowing a
-// specified amount of processes to run simultanously. It will allocate shared memory to represent a system clock. It will
-// also keep track of a process control block table for all processes and a resource table for 5 resource types with 10 
-// instances each. It will receive messages from child processes that represent a resource request or release. If it 
-// receives a request, it will grant the request if possible or it will add the child to a wait queue if not possible.
-// When requests/releases are received, it will update values in both tables to reflect this. It will print both tables 
-// every .5 sec of system time. It will run a deadlock detection algorithm every 1 sec of system time. If a deadlock is
-// found, it will run a recovery algorithm, incrementally killing processes, until the system is no longer in a deadlock.
-// It will calculate and print final statistics at the end of each run.
-// The program will send a kill signal to all processes and terminate if 3 real-life seconds are reached.
+// specified amount of processes to run simultaneously. It will allocate shared memory to represent a system clock. It will
+// also keep track of a process control block table for all processes, each with a 32 entry page table, and a page frame 
+// table of 256 frames. It will receive messages from child processes that represent a memory request to read or write. If
+// the requested page is in the frame table, it will grant the request and update the PCB and frame table to reflect this. 
+// In the case of a page fault, it will add the worker to a wait queue, and add the required latency. Once this time has passed,
+// it will load the page using the least recently used algorithm and update all tables to reflect this. It will print all tables 
+// every 1 sec of system time. It will calculate and print final statistics at the end of each run.
+// The program will send a kill signal to all processes and terminate if 5 real-life seconds are reached.
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -31,7 +30,7 @@
 
 #define PERMS 0644
 #define MAX_PROC 18
-#define FRAME_NUM 8
+#define FRAME_NUM 256
 
 using namespace std;
 
@@ -47,26 +46,27 @@ typedef struct
 // Structure for Process Control Block
 typedef struct
 {
-        int occupied; // Either true or false
+        int occupied; // Either true or false, determines if slot is occupied
         pid_t pid; // Process ID of this child
-        int startSeconds; // Time when it was forked
-        int startNano; // Time when it was forked
-	int pageTable [32];
-	bool waiting;
-	int waitPage;
-	bool waitIsWrite;
-	long long waitSec;
-	long long waitNano;
+        int startSeconds; // Second time when it was forked
+        int startNano; // Nanosecond time when it was forked
+	int pageTable [32]; // Process's 32 pages for frame
+	bool waiting; // True if process is currently waiting due to page fault
+	int waitPage; // Page number processes is waiting to be loaded
+	bool waitIsWrite; // True if waiting reference is a write
+	long long waitSec; // Second time of page fault
+	long long waitNano; // Nanosecond time of page fault
 } PCB;
 
+// Structure for frame table
 typedef struct
 {
-	bool occupied;
-	bool dirty;
-	pid_t ownerPid;
-	int pageNum;
-	long long lastRefSec;
-	long long lastRefNano;
+	bool occupied; // Either true or false, determines if frame is free to use
+	bool dirty; // True if frame has been written
+	pid_t ownerPid; // PID of process that owns page in frame
+	int pageNum; // Page number in frame
+	long long lastRefSec; // Second time of access
+	long long lastRefNano; // Nanosecond time of access
 } Frame;
 
 // Message buffer for communication between OSS and child processes
@@ -158,9 +158,12 @@ void shareMem()
 	shm_ptr[1] = 0;
 }
 
-// FUnction to print formatted process table and resource table to console. Will also print to logfile if necessary.
+// Function to print formatted process table, each process's page table,  and frame table to console. Will also print to logfile if necessary.
 void printInfo(int n)
 {
+
+	printf("\n");
+	if (logging) fprintf(logfile, "\n");
 
 	// Print process control block 	
 	printf("OSS PID: %d SysClockS: %u SysClockNano: %u\n Process Table:\n", getpid(), shm_ptr[0], shm_ptr[1]);
@@ -180,12 +183,53 @@ void printInfo(int n)
 	}
 	printf("\n");
 	if (logging) fprintf(logfile, "\n");
+
+	// Print frame table
+	printf("Current memory layout at time %u:%09u is:\n", shm_ptr[0], shm_ptr[1]);
+	if (logging) fprintf(logfile, "Current memory layout at time %u:%09u is:\n", shm_ptr[0], shm_ptr[1]);
+
+	printf("      %-8s %-8s %-8s %-12s\n", "Occupied", "DirtyBit", "LastRefS", "LastRefNano");
+	if (logging) fprintf(logfile, "      %-8s %-8s %-8s %-12s\n", "Occupied", "DirtyBit", "LastRefS", "LastRefNano");
+
+	for (int i = 0; i < FRAME_NUM; i++)
+	{
+		string occ = "No";
+		if (frameTable[i].occupied)
+			occ = "Yes";
+		printf("Frame %d: %-8s %-8d %-8lld %-12lld\n", i, occ.c_str(), frameTable[i].dirty, frameTable[i].lastRefSec, frameTable[i].lastRefNano);
+		if (logging)
+			fprintf(logfile, "Frame %d: %-8s %-8d %-8lld %-12lld\n", i, occ.c_str(), frameTable[i].dirty, frameTable[i].lastRefSec, frameTable[i].lastRefNano);
+	}
+	printf("\n");
+	if (logging) fprintf(logfile, "\n");
+
+	// Print each process's page table
+	for (int i = 0; i < n; i++)
+	{
+		if(!processTable[i].occupied) continue;
+		printf("P%d page table: [", i);
+		if (logging) fprintf(logfile,"P%d page table: [", i);
+		for (int j = 0; j < 32; j++)
+		{
+			printf(" %d", processTable[i].pageTable[j]);
+			if (logging) fprintf(logfile, " %d", processTable[i].pageTable[j]);
+		}
+		printf(" ]\n");
+		if (logging) fprintf(logfile, " ]\n");
+	}
+
+	printf("\n");
+	if (logging) fprintf(logfile, "\n");
+
 }
 
+// Function to perform least recently used algorithm on frame table, passing in process's PCB index as parameter
 int lruReplacement(int slot)
 {
+	// Get page number that process is waiting to load
 	unsigned page = processTable[slot].waitPage;
 	
+	// Attempt to find free frame
 	int frame = -1;
 	for (int i = 0; i < FRAME_NUM; i++)
 	{
@@ -196,10 +240,12 @@ int lruReplacement(int slot)
 		}
 	}
 
-	if (frame < 0)
+	if (frame < 0) // If true, no free frame found
 	{
+		// Take first frame in table and calculate time referenced
 		frame = 0;
 		long long oldest = (long long)frameTable[0].lastRefSec * 1000000000 + (long long)frameTable[0].lastRefNano;
+		// Increment through rest of frame table, updating oldest value to find frame used the longest time ago
 		for (int i = 1; i < FRAME_NUM; i++)
 		{
 			long long t = (long long)frameTable[i].lastRefSec * 1000000000 + (long long)frameTable[i].lastRefNano;
@@ -210,6 +256,13 @@ int lruReplacement(int slot)
 			}
 		}
 
+
+		// Print frame swap
+		printf("oss: Clearing frame %d and swapping in p%d page %u\n", frame, slot, page);
+		if (logging)
+			fprintf(logfile, "oss: Clearing frame %d and swapping in p%d page %u\n", frame, slot, page);
+
+		// Find pid of process who the frame belonged to, and remove page from process's table
 		pid_t victim = frameTable[frame].ownerPid;
 		int vicPage = frameTable[frame].pageNum;
 		for (int i = 0; i < MAX_PROC; i++)
@@ -222,21 +275,25 @@ int lruReplacement(int slot)
 		}
 	}
 
+	// Update PCB and frame table to add new frame for process
 	processTable[slot].pageTable[page] = frame;
 	frameTable[frame].occupied = true;
 	frameTable[frame].ownerPid = processTable[slot].pid;
 	frameTable[frame].pageNum = page;
+	// Set dirty bit based on whether request was read or write
 	frameTable[frame].dirty = processTable[slot].waitIsWrite;
+	// Update time last referenced in frame table
 	frameTable[frame].lastRefSec = shm_ptr[0];
 	frameTable[frame].lastRefNano = shm_ptr[1];
 
+	// Return found frame
 	return frame;
 }
 
-// Signal handler to terminate all processes after 3 seconds in real time
+// Signal handler to terminate all processes after 5 seconds in real time
 void signal_handler(int sig)
 {
-	printf("3 seconds have passed, process(es) will now terminate.\n");
+	printf("5 seconds have passed, process(es) will now terminate.\n");
 	pid_t pid;
 
 	// Loop through process table to find all processes still running and terminate
@@ -274,9 +331,9 @@ void signal_handler(int sig)
 
 int main(int argc, char* argv[])
 {
-	// Signal that will terminate program after 3 sec (real time)
+	// Signal that will terminate program after 5 sec (real time)
 	signal(SIGALRM, signal_handler);
-	alarm(3);
+	alarm(5);
 
 	key_t key; // Key to access queue
 
@@ -309,11 +366,12 @@ int main(int argc, char* argv[])
 
 
 	// Values to keep track of child iterations
-	int total = 0; // Total amount of processes
-	running = 0;
-	int msgsnt = 0;
+	int total = 0; // Total number of child processes spawned
+	running = 0; // Number of simultaneous processes in system
+	int totRefs = 0; // Total number of memory reference requests received
+	int totFaults = 0; // Total number of page faults
 
-	const char optstr[] = "hn:s:t:i:f"; // Options h, n, s, t, i, f
+	const char optstr[] = "hn:s:i:f"; // Options h, n, s, t, i, f
 	char opt;
 	
 	// Parse command line arguments with getopt
@@ -356,8 +414,13 @@ int main(int argc, char* argv[])
 					}
 				}
 
-				// Set proc to optarg and break
+				// Set proc to optarg, ensure no more than 100 proc,  and break
 				options.proc = atoi(optarg);
+				if (options.proc > 100)
+				{
+					fprintf(stderr, "Warning: no more than 100 total processes allowed, -n will be set to 100\n");
+					options.proc = 100;
+				}
 				break;
 			
 			case 's': // Total amount of processes that can run simultaneously
@@ -459,7 +522,7 @@ int main(int argc, char* argv[])
 	shareMem();
 
 	// Allocate memory for process table based on total processes
-	processTable = new PCB[20];
+	processTable = new PCB[MAX_PROC];
 	// Initialize process table, all values set to empty
 	for (int i = 0; i < MAX_PROC; i++)
 	{
@@ -479,7 +542,9 @@ int main(int argc, char* argv[])
 		}
 	}
 
+	// Allocate memory for frame table based on total frames
 	frameTable = new Frame[FRAME_NUM];
+	// Initialize frame table, all values set to empty
 	for (int i = 0; i < FRAME_NUM; i++)
 	{
 		frameTable[i].occupied = false;
@@ -521,6 +586,23 @@ int main(int argc, char* argv[])
 				}
 			}
 
+			// Clear process's entires in PCB and frame table
+			for (int i = 0; i < 32; i++)
+			{
+				processTable[indx].waiting = false;
+			}
+
+			for (int i = 0; i < FRAME_NUM; i++)
+			{
+				if (frameTable[i].ownerPid == pid)
+				{
+					frameTable[i].occupied = false;
+					frameTable[i].ownerPid = -1;
+					frameTable[i].pageNum = -1;
+					frameTable[i].dirty = false;
+				}
+			}
+
 			// Mark finished process as unoccupied in process table
 			processTable[indx].occupied = 0;
 			// Decrement total processes running
@@ -539,10 +621,10 @@ int main(int argc, char* argv[])
 		// Calculate total time sincd last print in ns
 		long long int printTotDiff = printDiffSec * 1000000000 + printDiffNs;
 
-		if (printTotDiff >= 500000000) // Determine if time of last print surpasssed .5 sec system time
+		if (printTotDiff >= 1000000000) // Determine if time of last print surpasssed .5 sec system time
 		{
 			// If true, print table and update time since last print in sec and ns
-			//printInfo(18);
+			printInfo(18);
 			lastPrintSec = shm_ptr[0];
 			lastPrintNs = shm_ptr[1];
 		}
@@ -594,8 +676,13 @@ int main(int argc, char* argv[])
 			}
 		}
 
+		// Check for message from worker process
 		if (msgrcv(msqid, &rcvbuf, sizeof(msgbuffer) - sizeof(long), 1, IPC_NOWAIT) > 0)
 		{
+			// Increment total reference requests
+			totRefs++;
+
+			// Find process who sent message in PCB
 			int slot = -1;
 			for (int i = 0; i < MAX_PROC; i++)
 			{
@@ -606,6 +693,7 @@ int main(int argc, char* argv[])
 				}
 			}
 
+			// Calculate page number from address sent, ensuring it is not greater than max amount of entries
 			unsigned page = rcvbuf.address / 1024;
 			if (page >= 32)
 			{
@@ -613,15 +701,37 @@ int main(int argc, char* argv[])
 				exit(1);
 			}
 
+			// Determine if request was read or write and set to string for printing
+			string op;
+			if (rcvbuf.isWrite) op = "write";
+			else op = "read";
+
+			// Print incoming request
+			printf("oss: P%d requesting %s of address %u at time %d:%09d\n", slot, op.c_str(), rcvbuf.address, shm_ptr[0], shm_ptr[1]);
+			if (logging)
+				fprintf(logfile, "oss: P%d requesting %s of address %u at time %d:%09d\n", slot, op.c_str(), rcvbuf.address, shm_ptr[0], shm_ptr[1]);
+
 			
-			// Check page table entry
+			// Check page table entry 
 			int frame = processTable[slot].pageTable[page];
-			if (frame != -1)
+			if (frame != -1) // Determine if frame found in table
 			{
+				// Add overhead
 				addOverhead();
+				// Add additional 100ns for accessing, ensuring no overflow
+				shm_ptr[1] += 100;
+				if (shm_ptr[1] >= 1000000000)
+				{
+					shm_ptr[1] -= 1000000000;
+					shm_ptr[0]++;
+				}
+
+
+				// Update last reference time in frame table
 				frameTable[frame].lastRefSec = shm_ptr[0];
 				frameTable[frame].lastRefNano = shm_ptr[1];
 
+				// Prepare and send message to worker, granting requst
 				buf.mtype = rcvbuf.pid;
 				buf.granted = true;
 				if (msgsnd(msqid, &buf, sizeof(msgbuffer) - sizeof(long), 0) == -1)
@@ -629,11 +739,37 @@ int main(int argc, char* argv[])
 					perror("msgsnd grant");
 					exit(1);
 				}
-				else printf("OSS: P%d page %u HIT in frame %d at time %d:%09d\n", slot, page, frame, shm_ptr[0], shm_ptr[1]);
+				else
+				{
+					// Determine whether it is a read or write
+					if (rcvbuf.isWrite)
+					{
+						// Update dirty bit if it is a write
+						frameTable[frame].dirty = true;
+						// Print write
+						printf("oss: Address %u in frame %d, writing data to frame at time %d:%09d\n", rcvbuf.address, frame, shm_ptr[0], shm_ptr[1]);
+						if (logging)
+							fprintf(logfile, "oss: Address %u in frame %d, writing data to frame at time %d:%09d\n", rcvbuf.address, frame, shm_ptr[0], shm_ptr[1]);
+					}
+					else
+					{
+						// Print read
+						printf("oss: Address %u in frame %d, giving data to P%d at time %d:%09d\n", rcvbuf.address, frame, slot, shm_ptr[0], shm_ptr[1]);
+						if (logging)
+							fprintf(logfile, "oss: Address %u in frame %d, giving data to P%d at time %d:%09d\n", rcvbuf.address, frame, slot, shm_ptr[0], shm_ptr[1]);
+					}
+					
+				}
 			}
 			else // Page fault
 			{
-				printf("OSS: P%d page %u FAULT at time %d:%09d... queueing\n", slot, page, shm_ptr[0], shm_ptr[1]);
+				// Increment total page faults
+				totFaults++;
+
+				// Print page fault
+				printf("oss: Address %u is not in a frame, pagefault\n", rcvbuf.address);
+				if (logging)
+					fprintf(logfile, "oss: Address %u is not in a frame, pagefault\n", rcvbuf.address);
 
 				// Mark process in PCB table as waiting
 				processTable[slot].waiting = true;
@@ -647,26 +783,36 @@ int main(int argc, char* argv[])
 			}
 		}
 
+		// Check for any waiting processes in the queue
 		if (!waitQueue.empty())
 		{
+			// Get index of next waiting process from queue 
 			int slot = waitQueue.front();
 			
+			// Compute elapsed system time since fault
 			currTimeNs = ((long long)shm_ptr[0] * 1000000000) + (long long)shm_ptr[1];
 			long long faultNs = (long long)processTable[slot].waitSec * 1000000000 + (long long)processTable[slot].waitNano;
+			// Add latency for page fault
 			long long latNs = 14 * 1000000;
 			if (processTable[slot].waitIsWrite)
 				latNs += 1000000;
 
+			// Determine if enough time has passed to service page fault
 			if (currTimeNs - faultNs >= latNs)
 			{
+				// Remove process from wait queue
 				waitQueue.pop();
+
+
+				// Load faulted page into frame using LRU replacement algorithm
 				unsigned page = processTable[slot].waitPage;
-				
 				int frame = lruReplacement(slot);
 
+				// Update info in process table to reflect loaded page
 				processTable[slot].pageTable[page] = frame;
 				processTable[slot].waiting = false;
 
+				// Update info in frame table to reflect loaded page
 				frameTable[frame].occupied = true;
 				frameTable[frame].ownerPid = processTable[slot].pid;
 				frameTable[frame].pageNum = page;
@@ -674,8 +820,10 @@ int main(int argc, char* argv[])
 				frameTable[frame].lastRefSec = shm_ptr[0];
 				frameTable[frame].lastRefNano = shm_ptr[1];
 
+				// Add overhead of loading page
 				addOverhead();
 
+				// Prepare and send message to worker, granting requesst
 				buf.mtype = processTable[slot].pid;
 				buf.granted = true;
 				if (msgsnd(msqid, &buf, sizeof(buf) - sizeof(long), 0) == -1)
@@ -683,12 +831,50 @@ int main(int argc, char* argv[])
 					perror("msgsnd queue grant");
 					exit(1);
 				}
-				else printf("OSS: serviced P%d page %u in frame %d at time %d:%09d\n", slot, page, processTable[slot].pageTable[page], shm_ptr[0], shm_ptr[1]);
+
+				// Determine if read or write for printing
+				string opr = "read";
+				if(processTable[slot].waitIsWrite) 
+				{
+					// If write, print and add additional time (dirty bit set in LRU algorithm)
+					opr = "write";
+					printf("oss: Dirty bit of frame %d set, adding additional time to the clock\n", frame);
+					if (logging)
+						fprintf(logfile, "oss: Dirty bit of frame %d set, adding additional time to the clock\n", frame);
+					addOverhead();
+				}
+
+				// Determine address of process and print
+				unsigned addr = processTable[slot].waitPage * 1024;
+				printf("oss: Indicating to P%d that %s has happened to the address %u\n", slot, opr.c_str(), addr);
+				if (logging)
+					fprintf(logfile, "oss: Indicating to P%d that %s has happened to the address %u\n", slot, opr.c_str(), addr);
 			}
 		}
 
 	}
 
+	// Update time for statistics
+	currTimeNs = ((long long)shm_ptr[0] * 1000000000) + (long long)shm_ptr[1];
+
+	// Calculate and print statistics
+	double refsPerSec = ((double)totRefs * 1000000000) / currTimeNs;
+
+	double faultRate;
+	if (totRefs > 0)
+		faultRate = (100.0 * totFaults) / totRefs;
+	else faultRate = 0.0;
+
+	printf("\n----Simulation Statistics----\n");
+	if (logging) fprintf(logfile, "\n----Simulation Statistics----\n");
+	printf("Total memory references: %d\n", totRefs);
+	if (logging) fprintf(logfile, "Total memory references: %d\n", totRefs);
+	printf("Total page faults: %d\n", totFaults);
+	if (logging) fprintf(logfile, "Total page faults: %d\n", totFaults);
+	printf("Fault rate: %.2f%%\n", faultRate);
+	if (logging) fprintf(logfile, "Fault rate: %.2f%%\n", faultRate);
+	printf("References per sec of system time: %.2f\n", refsPerSec);
+	if (logging) fprintf(logfile, "References per sec of system time: %.2f\n", refsPerSec);
 
 	// Detach from shared memory and remove it
 	if(shmdt(shm_ptr) == -1)
